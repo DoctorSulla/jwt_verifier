@@ -1,18 +1,27 @@
-use std::collections::HashMap;
-
 use base64::{DecodeError, Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::Utc;
+#[cfg(not(test))]
 use reqwest::Client;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
-use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 
+mod stubs;
+
 #[derive(Error, Debug)]
 pub enum JwtParsingError {
-    #[error("Signature does not match metadata and payload")]
+    #[error("AUD does not match provided client id")]
+    ClientIdMismatch,
+    #[error("The token start date is in the future")]
+    TokenFromFuture,
+    #[error("The token is expired")]
+    TokenExpired,
+    #[error("Kid not found")]
+    KidNotPresentInList,
+    #[error("Signature does not match metadata and claims")]
     SignatureDoesNotMatch,
     #[error("JWT must have three separate parts")]
     InvalidNumberOfParts,
@@ -20,6 +29,12 @@ pub enum JwtParsingError {
     DecodingError(#[from] DecodeError),
     #[error("Error from serde_json: {0}")]
     DeserializeError(#[from] serde_json::Error),
+    #[error("Error from reqwest: {0}")]
+    NetworkError(#[from] reqwest::Error),
+    #[error("Error from rsa: {0}")]
+    RsaError(#[from] rsa::Error),
+    #[error("Error from rsa signature: {0}")]
+    RsaSignatureError(#[from] rsa::signature::Error),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -32,14 +47,15 @@ struct Metadata {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Claims {
     iss: String,
-    azp: String,
+    azp: Option<String>,
     aud: String,
     sub: String,
+    hd: Option<String>,
     email: String,
     email_verified: bool,
     nbf: i64,
     name: String,
-    picture: String,
+    picture: Option<String>,
     given_name: String,
     family_name: String,
     iat: i64,
@@ -48,12 +64,12 @@ pub struct Claims {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct GoogleKeys {
+pub struct GoogleKeys {
     keys: Vec<Key>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Key {
+pub struct Key {
     kid: String,
     alg: String,
     kty: String,
@@ -62,24 +78,30 @@ struct Key {
     r#use: String,
 }
 
+#[cfg(not(test))]
 const GOOGLE_KEY_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 
-pub async fn fetch_key_by_kid(kid: &str) -> Result<RsaPublicKey, JwtParsingError> {
-    let client = Client::new();
-    let response: GoogleKeys = client
-        .get(GOOGLE_KEY_URL)
-        .send()
-        .await
-        .expect("Unable to fetch keys from Google")
-        .json()
-        .await
-        .expect("Unable to parse keys response into expected format");
+#[cfg(test)]
+pub async fn get_google_keys() -> Result<GoogleKeys, JwtParsingError> {
+    let response: GoogleKeys = serde_json::from_str(stubs::KEYS_STUB)?;
+    Ok(response)
+}
 
-    let key = response
-        .keys
-        .into_iter()
-        .find(|v| v.kid == kid)
-        .expect("Provided kid not found in response");
+#[cfg(not(test))]
+pub async fn get_google_keys() -> Result<GoogleKeys, JwtParsingError> {
+    let client = Client::new();
+    let response: GoogleKeys = client.get(GOOGLE_KEY_URL).send().await?.json().await?;
+
+    Ok(response)
+}
+
+pub async fn fetch_key_by_kid(kid: &str) -> Result<RsaPublicKey, JwtParsingError> {
+    let response = get_google_keys().await?;
+
+    let key = match response.keys.into_iter().find(|v| v.kid == kid) {
+        Some(v) => v,
+        None => return Err(JwtParsingError::KidNotPresentInList),
+    };
 
     let decoded_n = URL_SAFE_NO_PAD.decode(key.n)?;
 
@@ -87,47 +109,66 @@ pub async fn fetch_key_by_kid(kid: &str) -> Result<RsaPublicKey, JwtParsingError
 
     let decoded_e = URL_SAFE_NO_PAD.decode(key.e.as_bytes())?;
 
-    // Get the decimal value of e
-    let mut total: u32 = 0;
-    for (index, byte) in decoded_e.iter().enumerate() {
-        total += u32::pow(256, index as u32) * *byte as u32;
-    }
+    let e = BigUint::from_bytes_be(&decoded_e);
 
-    let e = BigUint::from(total);
-
-    Ok(RsaPublicKey::new(n, e).unwrap())
+    Ok(RsaPublicKey::new(n, e)?)
 }
 
-pub async fn verify(raw_jwt: &str) -> Result<Claims, JwtParsingError> {
+pub async fn verify(
+    raw_jwt: &str,
+    validate_expiry: bool,
+    client_id: &str,
+) -> Result<Claims, JwtParsingError> {
     let parts: Vec<&str> = raw_jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtParsingError::InvalidNumberOfParts);
     }
 
     let raw_metadata = parts[0];
-    let raw_payload = parts[1];
+    let raw_claims = parts[1];
     let raw_signature = parts[2];
 
     let decoded_metadata = URL_SAFE_NO_PAD.decode(raw_metadata.as_bytes())?;
-    let decoded_payload = URL_SAFE_NO_PAD.decode(raw_payload.as_bytes())?;
+    let decoded_claims = URL_SAFE_NO_PAD.decode(raw_claims.as_bytes())?;
 
     let metadata: Metadata = serde_json::from_slice(&decoded_metadata)?;
-    let payload: Claims = serde_json::from_slice(&decoded_payload)?;
+    let claims: Claims = serde_json::from_slice(&decoded_claims)?;
 
-    let decoded_signature = URL_SAFE_NO_PAD.decode(raw_signature.as_bytes()).unwrap();
+    if validate_expiry {
+        check_timestamps(&claims)?
+    }
 
-    let signature = Signature::try_from(&decoded_signature[..]).unwrap();
+    if &claims.aud != client_id {
+        return Err(JwtParsingError::ClientIdMismatch);
+    }
 
-    let to_sign = format!("{}.{}", raw_metadata, raw_payload);
+    let decoded_signature = URL_SAFE_NO_PAD.decode(raw_signature.as_bytes())?;
 
-    let public_key = fetch_key_by_kid(&metadata.kid).await.unwrap();
+    let signature = Signature::try_from(&decoded_signature[..])?;
+
+    let to_sign = format!("{}.{}", raw_metadata, raw_claims);
+
+    let public_key = fetch_key_by_kid(&metadata.kid).await?;
 
     let verifying_key = VerifyingKey::<Sha256>::new(public_key);
 
     let _ = match verifying_key.verify(&to_sign.as_bytes(), &signature) {
-        Ok(_v) => return Ok(payload),
+        Ok(_v) => return Ok(claims),
         Err(_e) => return Err(JwtParsingError::SignatureDoesNotMatch),
     };
+}
+
+pub fn check_timestamps(claims: &Claims) -> Result<(), JwtParsingError> {
+    let now = Utc::now().timestamp();
+    //let now = 1758440560;
+    if now > claims.exp {
+        return Err(JwtParsingError::TokenExpired);
+    } else if now < claims.nbf {
+        return Err(JwtParsingError::TokenFromFuture);
+    } else if now < claims.iat {
+        return Err(JwtParsingError::TokenFromFuture);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -138,7 +179,13 @@ mod tests {
 
     #[tokio::test]
     async fn valid_jwt_signature_matches() {
-        let verify = verify(VALID_JWT).await;
+        let verify = verify(
+            VALID_JWT,
+            true,
+            "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+        )
+        .await;
+        println!("{:?}", verify);
         assert!(verify.is_ok());
     }
 }
