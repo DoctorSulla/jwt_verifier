@@ -124,6 +124,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signature",
  "thiserror",
 ]
 
@@ -301,6 +302,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core",
+ "sha2",
  "signature",
  "spki",
  "subtle",

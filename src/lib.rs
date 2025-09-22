@@ -1,8 +1,9 @@
 use base64::{DecodeError, Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rsa::pkcs1v15::Pkcs1v15Sign;
-use rsa::{BigUint, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::signature::Verifier;
+use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -52,9 +53,12 @@ pub fn verify(raw_jwt: &str) -> Result<String, JwtParsingError> {
 
     let decoded_e = URL_SAFE_NO_PAD.decode(raw_e.as_bytes()).unwrap();
 
-    let mut u32_bytes: Vec<u32> = decoded_e.iter().map(|v| *v as u32).collect();
+    let mut total: u32 = 0;
+    for (index, byte) in decoded_e.iter().enumerate() {
+        total += u32::pow(256, index as u32) * *byte as u32;
+    }
 
-    let e = BigUint::new(u32_bytes);
+    let e = BigUint::from(total);
 
     let parts: Vec<&str> = raw_jwt.split('.').collect();
     if parts.len() != 3 {
@@ -65,16 +69,21 @@ pub fn verify(raw_jwt: &str) -> Result<String, JwtParsingError> {
     let raw_payload = parts[1];
     let raw_signature = parts[2];
 
+    let decoded_signature = URL_SAFE_NO_PAD.decode(raw_signature.as_bytes()).unwrap();
+
+    let slice = &decoded_signature[..];
+
+    let sig = Signature::try_from(slice).unwrap();
+
     let to_sign = format!("{}.{}", raw_metadata, raw_payload);
-
-    let hash = Sha256::digest(to_sign);
-    println!("{:X?}", hash);
-
-    //println!("{:?}", hex);
 
     let public_key = RsaPublicKey::new(n, e).unwrap();
 
-    //public_key.verify(to_sign, hashed, sig)
+    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+
+    let result = verifying_key.verify(&to_sign.as_bytes(), &sig);
+
+    println!("{:?}", result);
 
     let decoded_metadata = URL_SAFE_NO_PAD.decode(raw_metadata.as_bytes()).unwrap();
     let decoded_payload = URL_SAFE_NO_PAD.decode(raw_payload.as_bytes()).unwrap();

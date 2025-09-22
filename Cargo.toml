@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22.1"
-rsa = "0.9.8"
+rsa = { version = "0.9.8", features = ["sha2"] }
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
+signature = "2.2.0"
 thiserror = "2.0.16"
