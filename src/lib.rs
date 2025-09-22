@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
 use base64::{DecodeError, Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use reqwest::Client;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
@@ -8,10 +12,14 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum JwtParsingError {
+    #[error("Signature does not match metadata and payload")]
+    SignatureDoesNotMatch,
     #[error("JWT must have three separate parts")]
     InvalidNumberOfParts,
     #[error("Error from base 64 decoder: {0}")]
-    InvalidMetaData(#[from] DecodeError),
+    DecodingError(#[from] DecodeError),
+    #[error("Error from serde_json: {0}")]
+    DeserializeError(#[from] serde_json::Error),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -22,7 +30,7 @@ struct Metadata {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct GoogleJwt {
+pub struct Claims {
     iss: String,
     azp: String,
     aud: String,
@@ -39,20 +47,47 @@ struct GoogleJwt {
     jti: String,
 }
 
-// {"iss":"https://accounts.google.com","azp":"988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com","aud":"988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com","sub":"103095439063867298671","email":"matthew.halliday@gmail.com","email_verified":true,"nbf":1758440656,"name":"Matthew Halliday","picture":"https://lh3.googleusercontent.com/a/ACg8ocJBye9MzzYiLH5D4k9--Up5IYo3taQlbnwESHJgHz_hbAS8HVyx=s96-c","given_name":"Matthew","family_name":"Halliday","iat":1758440956,"exp":1758444556,"jti":"ca7efff4133fc544efcba761f6839618fee9e8cf"}
-//Metadata { alg: "RS256", kid: "07f078f2647e8cd019c40da9569e4f5247991094", typ: "JWT" }
+#[derive(Serialize, Deserialize, Debug)]
+struct GoogleKeys {
+    keys: Vec<Key>,
+}
 
-pub fn verify(raw_jwt: &str) -> Result<String, JwtParsingError> {
-    let raw_n = "pX0uFURVHarx3LZWaF4LnP3Kh2MbVl3iEOpQUcSxADEutXj383X9ZU6wdCmX4y_K23b0BU6oID1q0jkEE3sfQYaJJ7Qj9u2UnT-G9oGUoAn9GV1AYWxCNSz9mCrIJxP7ywcrvWJsKiYo7Q3Q-Tz44W1dCdVDQW870eixQSCnc6xrz4tu7RKrpeStH_GDhNIY3tXOuZvlPIvv4PH5sL39RaQ36T8ceGTWVDlYogKtvUUWl2YCGhz0f5y_ToRKU_WjnOmrN25_x30chCH3uz6I1RUa8vTAjbxCk4H5d1NmFNgV1zMSUKG0qo2d91fbyjmIRyODPVuUzSozREcVeSF_3Q";
+#[derive(Serialize, Deserialize, Debug)]
+struct Key {
+    kid: String,
+    alg: String,
+    kty: String,
+    e: String,
+    n: String,
+    r#use: String,
+}
 
-    let decoded_n = URL_SAFE_NO_PAD.decode(raw_n).unwrap();
+const GOOGLE_KEY_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+pub async fn fetch_key_by_kid(kid: &str) -> Result<RsaPublicKey, JwtParsingError> {
+    let client = Client::new();
+    let response: GoogleKeys = client
+        .get(GOOGLE_KEY_URL)
+        .send()
+        .await
+        .expect("Unable to fetch keys from Google")
+        .json()
+        .await
+        .expect("Unable to parse keys response into expected format");
+
+    let key = response
+        .keys
+        .into_iter()
+        .find(|v| v.kid == kid)
+        .expect("Provided kid not found in response");
+
+    let decoded_n = URL_SAFE_NO_PAD.decode(key.n)?;
 
     let n = BigUint::from_bytes_be(&decoded_n);
 
-    let raw_e = "AQAB";
+    let decoded_e = URL_SAFE_NO_PAD.decode(key.e.as_bytes())?;
 
-    let decoded_e = URL_SAFE_NO_PAD.decode(raw_e.as_bytes()).unwrap();
-
+    // Get the decimal value of e
     let mut total: u32 = 0;
     for (index, byte) in decoded_e.iter().enumerate() {
         total += u32::pow(256, index as u32) * *byte as u32;
@@ -60,6 +95,10 @@ pub fn verify(raw_jwt: &str) -> Result<String, JwtParsingError> {
 
     let e = BigUint::from(total);
 
+    Ok(RsaPublicKey::new(n, e).unwrap())
+}
+
+pub async fn verify(raw_jwt: &str) -> Result<Claims, JwtParsingError> {
     let parts: Vec<&str> = raw_jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtParsingError::InvalidNumberOfParts);
@@ -69,31 +108,26 @@ pub fn verify(raw_jwt: &str) -> Result<String, JwtParsingError> {
     let raw_payload = parts[1];
     let raw_signature = parts[2];
 
+    let decoded_metadata = URL_SAFE_NO_PAD.decode(raw_metadata.as_bytes())?;
+    let decoded_payload = URL_SAFE_NO_PAD.decode(raw_payload.as_bytes())?;
+
+    let metadata: Metadata = serde_json::from_slice(&decoded_metadata)?;
+    let payload: Claims = serde_json::from_slice(&decoded_payload)?;
+
     let decoded_signature = URL_SAFE_NO_PAD.decode(raw_signature.as_bytes()).unwrap();
 
-    let slice = &decoded_signature[..];
-
-    let sig = Signature::try_from(slice).unwrap();
+    let signature = Signature::try_from(&decoded_signature[..]).unwrap();
 
     let to_sign = format!("{}.{}", raw_metadata, raw_payload);
 
-    let public_key = RsaPublicKey::new(n, e).unwrap();
+    let public_key = fetch_key_by_kid(&metadata.kid).await.unwrap();
 
     let verifying_key = VerifyingKey::<Sha256>::new(public_key);
 
-    let result = verifying_key.verify(&to_sign.as_bytes(), &sig);
-
-    println!("{:?}", result);
-
-    let decoded_metadata = URL_SAFE_NO_PAD.decode(raw_metadata.as_bytes()).unwrap();
-    let decoded_payload = URL_SAFE_NO_PAD.decode(raw_payload.as_bytes()).unwrap();
-
-    let metadata: Metadata = serde_json::from_slice(&decoded_metadata).unwrap();
-    let payload: GoogleJwt = serde_json::from_slice(&decoded_payload).unwrap();
-    println!("{metadata:?}");
-    println!("{payload:?}");
-
-    Ok("Success".to_string())
+    let _ = match verifying_key.verify(&to_sign.as_bytes(), &signature) {
+        Ok(_v) => return Ok(payload),
+        Err(_e) => return Err(JwtParsingError::SignatureDoesNotMatch),
+    };
 }
 
 #[cfg(test)]
@@ -102,12 +136,9 @@ mod tests {
 
     const VALID_JWT: &str = r##"eyJhbGciOiJSUzI1NiIsImtpZCI6IjA3ZjA3OGYyNjQ3ZThjZDAxOWM0MGRhOTU2OWU0ZjUyNDc5OTEwOTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiI5ODgzNDM5Mzg1MTktdmxlN2twczJsNWY2Y2Ruamx1aWJkYTI1bzY2aDJqcG4uYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJhdWQiOiI5ODgzNDM5Mzg1MTktdmxlN2twczJsNWY2Y2Ruamx1aWJkYTI1bzY2aDJqcG4uYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJzdWIiOiIxMDMwOTU0MzkwNjM4NjcyOTg2NzEiLCJlbWFpbCI6Im1hdHRoZXcuaGFsbGlkYXlAZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5iZiI6MTc1ODQ0MDY1NiwibmFtZSI6Ik1hdHRoZXcgSGFsbGlkYXkiLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSkJ5ZTlNenpZaUxINUQ0azktLVVwNUlZbzN0YVFsYm53RVNISmdIel9oYkFTOEhWeXg9czk2LWMiLCJnaXZlbl9uYW1lIjoiTWF0dGhldyIsImZhbWlseV9uYW1lIjoiSGFsbGlkYXkiLCJpYXQiOjE3NTg0NDA5NTYsImV4cCI6MTc1ODQ0NDU1NiwianRpIjoiY2E3ZWZmZjQxMzNmYzU0NGVmY2JhNzYxZjY4Mzk2MThmZWU5ZThjZiJ9.o5CVIXUiIZYW2-CBwiT9CjbaExnjiH90_QfX1r4hmKePachwLE_KG54p6octPwWx_L3COM4thQun7vx6k1ShFSx7x3pIit2BgwE6iJsZy9fSHdEGhjKnFuNZnocDyDCY94xYyaiLZCp5G39rPC8VmY8flBnnt5YjlmoX0pY_C_SzJhSZLe1oMSj1P4ZfyJkyg-sXtRMw32Z7whRCGN70_u9SkJXdZCoTNUWbkIQwzRrehW63Omw_9iRyRcZ9AbAlTxSi1YrkGJsrPclCK2HZmtXqybmlBgu2Zh6tejfDXGZntRrFMmx7QpJyuWRdPRmyPZSPXn8UOc3GrMuRUOF54g"##;
 
-    #[test]
-    fn it_works() {
-        match verify(VALID_JWT) {
-            Ok(_v) => panic!(""),
-            Err(e) => println!("{:?}", e),
-        };
-        assert_eq!(4, 4);
+    #[tokio::test]
+    async fn valid_jwt_signature_matches() {
+        let verify = verify(VALID_JWT).await;
+        assert!(verify.is_ok());
     }
 }
