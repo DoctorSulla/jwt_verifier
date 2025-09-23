@@ -3,7 +3,8 @@ use chrono::Utc;
 use reqwest::Client;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::signature::Verifier;
-use rsa::{BigUint, RsaPublicKey};
+use rsa::traits::PublicKeyParts;
+use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
@@ -79,12 +80,12 @@ pub struct GoogleKeys {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Key {
-    kid: String,
-    alg: String,
-    kty: String,
-    e: String,
-    n: String,
-    r#use: String,
+    pub kid: String,
+    pub alg: String,
+    pub kty: String,
+    pub e: String,
+    pub n: String,
+    pub r#use: String,
 }
 
 const GOOGLE_KEY_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
@@ -220,9 +221,7 @@ impl JwtVerifierClient {
             return Err(JwtParsingError::IssuerMismatch);
         }
 
-        if validate_expiry {
-            check_timestamps(&claims)?
-        }
+        check_timestamps(&claims)?;
 
         if &claims.aud != client_id {
             return Err(JwtParsingError::ClientIdMismatch);
@@ -258,6 +257,29 @@ pub fn check_timestamps(claims: &Claims) -> Result<(), JwtParsingError> {
     Ok(())
 }
 
+pub fn generate_mock_keys() -> (GoogleKeys, RsaPrivateKey) {
+    let mut rng = rand::thread_rng();
+    let bits = 2048;
+    let priv_key = RsaPrivateKey::new_with_exp(&mut rng, bits, &BigUint::from(65537u32))
+        .expect("failed to generate a key");
+    let pub_key = RsaPublicKey::from(&priv_key);
+
+    println!("{}", URL_SAFE_NO_PAD.encode(pub_key.n().to_string()));
+
+    let key = Key {
+        e: "AQAB".to_string(),
+        n: URL_SAFE_NO_PAD.encode(pub_key.n().to_string()),
+        kid: "AEFAEF".to_string(),
+        alg: "RS256".to_string(),
+        kty: "RSA".to_string(),
+        r#use: "sig".to_string(),
+    };
+
+    let keys = GoogleKeys { keys: vec![key] };
+
+    (keys, priv_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_jwt_signature_matches() {
+        generate_mock_keys();
         let mut jwt_client = JwtVerifierClient::test_client().await.unwrap();
         let result = jwt_client
             .verify(
