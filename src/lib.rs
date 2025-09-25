@@ -439,3 +439,156 @@ mod tests {
         ));
     }
 }
+
+
+    #[tokio::test]
+    async fn token_expires_within_margin_should_pass() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now - MARGIN,
+            now,
+            now + (MARGIN - 15), // expires in 15 seconds (within MARGIN of 30)
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(result.is_ok(), "Token should be valid when expiring within MARGIN");
+    }
+
+    #[tokio::test]
+    async fn token_expires_just_beyond_margin_should_fail() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now - MARGIN,
+            now,
+            now - (MARGIN + 1), // expires 1 second beyond MARGIN (now - (MARGIN + 1) + 30 = now - 1)
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(matches!(result, Err(JwtParsingError::TokenExpired)), "Token should be invalid when expiring beyond MARGIN");
+    }
+
+    #[tokio::test]
+    async fn token_nbf_within_margin_should_pass() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now + (MARGIN - 15), // nbf in 15 seconds (within MARGIN of 30)
+            now,
+            now + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(result.is_ok(), "Token should be valid when nbf is within MARGIN");
+    }
+
+    #[tokio::test]
+    async fn token_nbf_exactly_at_margin_should_pass() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now + MARGIN, // nbf exactly at MARGIN boundary (now + MARGIN - 30 = now)
+            now,
+            now + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(result.is_ok(), "Token should be valid when nbf is exactly at MARGIN boundary");
+    }
+
+    #[tokio::test]
+    async fn token_nbf_beyond_margin_should_fail() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now + (MARGIN + 31), // nbf 61 seconds in future, so now + MARGIN < nbf (61)
+            now,
+            now + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(matches!(result, Err(JwtParsingError::TokenFromFuture)), "Token should be invalid when nbf is beyond MARGIN");
+    }
+
+    #[tokio::test]
+    async fn token_iat_within_margin_should_pass() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now - MARGIN,
+            now + (MARGIN - 15), // iat in 15 seconds (within MARGIN of 30)
+            now + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(result.is_ok(), "Token should be valid when iat is within MARGIN");
+    }
+
+    #[tokio::test]
+    async fn token_iat_exactly_at_margin_should_pass() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now - MARGIN,
+            now + MARGIN, // iat exactly at MARGIN boundary (now + MARGIN - 30 = now)
+            now + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(result.is_ok(), "Token should be valid when iat is exactly at MARGIN boundary");
+    }
+
+    #[tokio::test]
+    async fn token_iat_beyond_margin_should_fail() {
+        let now = Utc::now().timestamp();
+        let (keys, jwt) = generate_test_jwt(
+            now - MARGIN,
+            now + (MARGIN + 31), // iat 61 seconds in future, so now + MARGIN < iat (61)
+            now + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(matches!(result, Err(JwtParsingError::TokenFromFuture)), "Token should be invalid when iat is beyond MARGIN");
+    }
