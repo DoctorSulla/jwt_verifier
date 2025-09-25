@@ -2,19 +2,24 @@ use base64::{DecodeError, Engine as _, engine::general_purpose::URL_SAFE_NO_PAD}
 use chrono::Utc;
 use reqwest::Client;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
-use rsa::rand_core::impls::fill_bytes_via_next;
 use rsa::signature::Verifier;
-use rsa::traits::PublicKeyParts;
-use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
+use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 
 #[cfg(test)]
+use rsa::RsaPrivateKey;
+#[cfg(test)]
 use rsa::pkcs1v15::SigningKey;
 #[cfg(test)]
+use rsa::rand_core::impls::fill_bytes_via_next;
+#[cfg(test)]
+use rsa::traits::PublicKeyParts;
+#[cfg(test)]
 use signature::{SignatureEncoding, SignerMut};
+#[cfg(test)]
+use std::sync::{Arc, LazyLock};
 
 mod stubs;
 
@@ -123,11 +128,10 @@ pub async fn get_google_keys(client: Client) -> Result<(GoogleKeys, i64), JwtPar
             if let Some(pos) = s.find("max-age=") {
                 let rest = &s[pos + "max-age=".len()..];
                 let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if !digits.is_empty() {
-                    if let Ok(seconds) = digits.parse::<i64>() {
+                if !digits.is_empty()
+                    && let Ok(seconds) = digits.parse::<i64>() {
                         expiry = now + seconds;
                     }
-                }
             }
         }
     } else if let Some(v) = headers.get("expires") {
@@ -242,7 +246,7 @@ impl JwtVerifierClient {
             check_timestamps(&claims)?;
         }
 
-        if &claims.aud != client_id {
+        if claims.aud != client_id {
             return Err(JwtParsingError::ClientIdMismatch);
         }
 
@@ -256,7 +260,7 @@ impl JwtVerifierClient {
 
         let verifying_key = VerifyingKey::<Sha256>::new(public_key);
 
-        let _ = match verifying_key.verify(&to_sign.as_bytes(), &signature) {
+        let _ = match verifying_key.verify(to_sign.as_bytes(), &signature) {
             Ok(_v) => return Ok(claims),
             Err(_e) => return Err(JwtParsingError::SignatureDoesNotMatch),
         };
@@ -268,16 +272,14 @@ pub fn check_timestamps(claims: &Claims) -> Result<(), JwtParsingError> {
     if now > claims.exp + MARGIN {
         return Err(JwtParsingError::TokenExpired);
     }
-    if let Some(nbf) = claims.nbf {
-        if now + MARGIN < nbf {
+    if let Some(nbf) = claims.nbf
+        && now + MARGIN < nbf {
             return Err(JwtParsingError::TokenFromFuture);
         }
-    }
-    if let Some(iat) = claims.iat {
-        if now + MARGIN < iat {
+    if let Some(iat) = claims.iat
+        && now + MARGIN < iat {
             return Err(JwtParsingError::TokenFromFuture);
         }
-    }
     Ok(())
 }
 
