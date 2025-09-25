@@ -1,18 +1,22 @@
 use base64::{DecodeError, Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use reqwest::Client;
-use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::rand_core::impls::fill_bytes_via_next;
 use rsa::signature::Verifier;
 use rsa::traits::PublicKeyParts;
 use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use signature::{SignerMut,SignatureEncoding};
+use std::sync::LazyLock;
 use thiserror::Error;
 
-mod stubs;
+#[cfg(test)]
+use rsa::pkcs1v15::SigningKey;
+#[cfg(test)]
+use signature::{SignatureEncoding, SignerMut};
 
+mod stubs;
 
 pub struct JwtVerifierClient {
     client: Client,
@@ -64,25 +68,24 @@ pub struct Claims {
     aud: String,
     sub: String,
     hd: Option<String>,
-    email: String,
-    email_verified: bool,
-    nbf: i64,
-    name: String,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    nbf: Option<i64>,
+    name: Option<String>,
     picture: Option<String>,
-    given_name: String,
-    family_name: String,
-    iat: i64,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    iat: Option<i64>,
     exp: i64,
-    jti: String,
+    jti: Option<String>,
 }
 
-
-#[derive(Serialize, Deserialize, Debug,Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GoogleKeys {
     keys: Vec<Key>,
 }
 
-#[derive(Serialize, Deserialize, Debug,Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Key {
     pub kid: String,
     pub alg: String,
@@ -92,8 +95,17 @@ pub struct Key {
     pub r#use: String,
 }
 
+pub static TEST_KEYPAIR: LazyLock<(RsaPrivateKey, RsaPublicKey)> = LazyLock::new(|| {
+    let mut rng = rand::thread_rng();
+    let privk = RsaPrivateKey::new_with_exp(&mut rng, 2048, &BigUint::from(65537u32))
+        .expect("Failed to generate test keypair");
+    let pubk = RsaPublicKey::from(&privk);
+    (privk, pubk)
+});
+
 const GOOGLE_KEY_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const DEFAULT_EXPIRY: i64 = 300;
+const MARGIN: i64 = 30;
 
 pub async fn get_google_keys(client: Client) -> Result<(GoogleKeys, i64), JwtParsingError> {
     // Send request and capture headers before consuming the body
@@ -215,7 +227,7 @@ impl JwtVerifierClient {
 
         let metadata: Metadata = serde_json::from_slice(&decoded_metadata)?;
 
-        if metadata.alg != "RS256" {
+        if metadata.alg.to_uppercase() != "RS256" {
             return Err(JwtParsingError::UnsupportedAlgorithm);
         }
 
@@ -225,7 +237,9 @@ impl JwtVerifierClient {
             return Err(JwtParsingError::IssuerMismatch);
         }
 
-        check_timestamps(&claims)?;
+        if validate_expiry {
+            check_timestamps(&claims)?;
+        }
 
         if &claims.aud != client_id {
             return Err(JwtParsingError::ClientIdMismatch);
@@ -250,23 +264,28 @@ impl JwtVerifierClient {
 
 pub fn check_timestamps(claims: &Claims) -> Result<(), JwtParsingError> {
     let now = Utc::now().timestamp();
-    //let now = 1758440560;
-    if now > claims.exp {
+    if now > claims.exp + MARGIN {
         return Err(JwtParsingError::TokenExpired);
-    } else if now < claims.nbf {
-        return Err(JwtParsingError::TokenFromFuture);
-    } else if now < claims.iat {
-        return Err(JwtParsingError::TokenFromFuture);
+    }
+    if let Some(nbf) = claims.nbf {
+        if now + MARGIN < nbf {
+            return Err(JwtParsingError::TokenFromFuture);
+        }
+    }
+    if let Some(iat) = claims.iat {
+        if now + MARGIN < iat {
+            return Err(JwtParsingError::TokenFromFuture);
+        }
     }
     Ok(())
 }
 
 pub fn generate_mock_keys() -> (GoogleKeys, RsaPrivateKey) {
     let mut rng = rand::thread_rng();
-    let bits = 2048;
-    let priv_key = RsaPrivateKey::new_with_exp(&mut rng, bits, &BigUint::from(65537u32))
-        .expect("failed to generate a key");
-    let pub_key = RsaPublicKey::from(&priv_key);
+
+    // Clone the static test keypair to avoid moving out of the static.
+    let priv_key = (*TEST_KEYPAIR).0.clone();
+    let pub_key = (*TEST_KEYPAIR).1.clone();
 
     let mut bytes = [0u8; 16];
     fill_bytes_via_next(&mut rng, &mut bytes);
@@ -287,7 +306,7 @@ pub fn generate_mock_keys() -> (GoogleKeys, RsaPrivateKey) {
 }
 
 #[cfg(test)]
-pub fn generate_test_jwt(nbf: i64, iat:i64, exp: i64) -> (GoogleKeys,String) {
+pub fn generate_test_jwt(nbf: i64, iat: i64, exp: i64) -> (GoogleKeys, String) {
     let (keys, private_key) = generate_mock_keys();
     let meta = Metadata {
         alg: "RS256".to_string(),
@@ -295,21 +314,22 @@ pub fn generate_test_jwt(nbf: i64, iat:i64, exp: i64) -> (GoogleKeys,String) {
         typ: "JWT".to_string(),
     };
 
-    let claims =  Claims { 
+    let claims =  Claims {
     iss: "https://accounts.google.com".to_string(),
-    azp: Some("988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com".to_string()), 
-    aud: "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com".to_string(), 
-    sub: "103095439063867298671".to_string(), 
-    hd: None, 
-    email: "matthew.halliday@gmail.com".to_string(), 
-    email_verified: true, 
-    nbf: nbf ,name: "Matthew Halliday".to_string(), 
-    picture: Some("https://lh3.googleusercontent.com/a/ACg8ocJBye9MzzYiLH5D4k9--Up5IYo3taQlbnwESHJgHz_hbAS8HVyx=s96-c".to_string()), 
-    given_name: "Matthew".to_string(), 
-    family_name: "Halliday".to_string(), 
-    iat: iat,
+    azp: Some("988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com".to_string()),
+    aud: "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com".to_string(),
+    sub: "103095439063867298671".to_string(),
+    hd: None,
+    email: Some("matthew.halliday@gmail.com".to_string()),
+    email_verified: Some(true),
+    nbf: Some(nbf),
+    name: Some("Matthew Halliday".to_string()),
+    picture: Some("https://lh3.googleusercontent.com/a/ACg8ocJBye9MzzYiLH5D4k9--Up5IYo3taQlbnwESHJgHz_hbAS8HVyx=s96-c".to_string()),
+    given_name: Some("Matthew".to_string()),
+    family_name: Some("Halliday".to_string()),
+    iat: Some(iat),
     exp: exp,
-    jti: "ca7efff4133fc544efcba761f6839618fee9e8cf".to_string() };
+    jti: Some("ca7efff4133fc544efcba761f6839618fee9e8cf".to_string()) };
 
     let meta_encoded = URL_SAFE_NO_PAD.encode(serde_json::to_string(&meta).unwrap());
     let claims_encoded = URL_SAFE_NO_PAD.encode(serde_json::to_string(&claims).unwrap());
@@ -320,7 +340,7 @@ pub fn generate_test_jwt(nbf: i64, iat:i64, exp: i64) -> (GoogleKeys,String) {
     let signature = signing_key.sign(to_sign.as_bytes()).to_bytes();
     let encoded_signature = URL_SAFE_NO_PAD.encode(signature);
     let jwt = format!("{meta_encoded}.{claims_encoded}.{encoded_signature}");
-(keys,jwt)
+    (keys, jwt)
 }
 
 #[cfg(test)]
@@ -331,7 +351,11 @@ mod tests {
 
     #[tokio::test]
     async fn valid_jwt_signature_matches() {
-        let (keys,jwt) = generate_test_jwt(Utc::now().timestamp() -30, Utc::now().timestamp(), Utc::now().timestamp() + 3600);
+        let (keys, jwt) = generate_test_jwt(
+            Utc::now().timestamp() - 30,
+            Utc::now().timestamp(),
+            Utc::now().timestamp() + 3600,
+        );
         let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
         let result = jwt_client
             .verify(
@@ -340,13 +364,34 @@ mod tests {
                 "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
             )
             .await;
-        println!("{:?}", result);
         assert!(result.is_ok());
     }
 
     #[tokio::test]
+    async fn invalid_client_id_fails() {
+        let (keys, jwt) = generate_test_jwt(
+            Utc::now().timestamp() - 30,
+            Utc::now().timestamp(),
+            Utc::now().timestamp() + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+        let result = jwt_client
+            .verify(
+                &jwt,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o76h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+        assert!(matches!(result, Err(JwtParsingError::ClientIdMismatch)));
+    }
+
+    #[tokio::test]
     async fn expired_jwt_fails() {
-        let (keys,jwt) = generate_test_jwt(Utc::now().timestamp() -7230, Utc::now().timestamp() - 7200, Utc::now().timestamp() - 3600);
+        let (keys, jwt) = generate_test_jwt(
+            Utc::now().timestamp() - 7230,
+            Utc::now().timestamp() - 7200,
+            Utc::now().timestamp() - 3600,
+        );
         let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
         let result = jwt_client
             .verify(
@@ -355,7 +400,42 @@ mod tests {
                 "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
             )
             .await;
+        assert!(matches!(result, Err(JwtParsingError::TokenExpired)));
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_fails() {
+        let (keys, jwt) = generate_test_jwt(
+            Utc::now().timestamp() - 30,
+            Utc::now().timestamp(),
+            Utc::now().timestamp() + 3600,
+        );
+        let mut jwt_client = JwtVerifierClient::test_client(keys.clone()).await.unwrap();
+
+        let (_keys, another_jwt) = generate_test_jwt(
+            Utc::now().timestamp() - 30,
+            Utc::now().timestamp(),
+            Utc::now().timestamp() + 3600,
+        );
+
+        let split_jwt: Vec<&str> = jwt.split('.').collect();
+        let split_another_jwt: Vec<&str> = another_jwt.split('.').collect();
+
+        let jwt_with_invalid_signature =
+            format!("{}.{}.{}", split_jwt[0], split_jwt[1], split_another_jwt[2]);
+
+        let result = jwt_client
+            .verify(
+                &jwt_with_invalid_signature,
+                true,
+                "988343938519-vle7kps2l5f6cdnjluibda25o66h2jpn.apps.googleusercontent.com",
+            )
+            .await;
+
         println!("{:?}", result);
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(JwtParsingError::SignatureDoesNotMatch)
+        ));
     }
 }

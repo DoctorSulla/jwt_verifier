@@ -1,5 +1,5 @@
 #[cfg(test)]
-pub const KEYS_STUB: &str = r##"{
+pub const _KEYS_STUB: &str = r##"{
   "keys": [
     {
       "kid": "07f078f2647e8cd019c40da9569e4f5247991094",
