@@ -53,7 +53,7 @@ pub struct Claims {
     iat: Option<i64>,
     exp: i64,
     jti: Option<String>,
-    nonce: Option<String>,
+    pub nonce: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
